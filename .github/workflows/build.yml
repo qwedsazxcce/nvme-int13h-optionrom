@@ -20,6 +20,7 @@ jobs:
       run: |
         cd src
         mkdir -p config/local
+        rm -rf ../.git
         make NO_WERROR=1 bin/ipxe.iso
 
     - name: Rename ISO
