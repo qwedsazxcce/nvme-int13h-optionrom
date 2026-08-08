@@ -19,6 +19,7 @@ jobs:
     - name: Build iPXE ISO
       run: |
         cd src
+        mkdir -p config/local
         make bin/ipxe.iso
 
     - name: Rename ISO
