@@ -28,18 +28,13 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 /** List of NVMe devices */
 static LIST_HEAD ( nvme_devices );
 
-// Page aligned "dma bounce buffer" in high memory
-#define NVME_DMA_BUF_SIZE (128 * 1024)  // 128KB = 256 sectors (512B)
-#define NVME_MAX_PRP_ENTRIES (NVME_DMA_BUF_SIZE / NVME_PAGE_SIZE)  // 32 pages
-
+// Page aligned "dma bounce buffer" of size NVME_PAGE_SIZE in high memory
 static volatile void *nvme_dma_buffer;
-static volatile u64 *nvme_prp_list;
 
 struct dma_mapping data_map;
 struct dma_mapping sqe_map;
 struct dma_mapping cqe_map;
 struct dma_mapping identify_map;
-struct dma_mapping prp_map;
 
 static inline __always_inline void forcemb ( void ) {
 asm volatile ( "mfence" : : : "memory" );
@@ -437,18 +432,12 @@ static void nvme_probe_ns(struct nvme_ctrl *ctrl, u32 ns_idx, u8 mdts)
     }
 
     if (!nvme_dma_buffer) {
-        nvme_dma_buffer = dma_alloc ( &ctrl->pci->dma, &data_map, NVME_DMA_BUF_SIZE, NVME_PAGE_SIZE );
+        nvme_dma_buffer = dma_alloc ( &ctrl->pci->dma, &data_map, NVME_PAGE_SIZE, NVME_PAGE_SIZE );
         if (!nvme_dma_buffer) {
             DBGC ( ctrl, "Failed to allocate NVMe DMA buffer\n");
             goto free_buffer;
         }
-        memset(nvme_dma_buffer, 0, NVME_DMA_BUF_SIZE);
-
-        nvme_prp_list = dma_alloc ( &ctrl->pci->dma, &prp_map, NVME_MAX_PRP_ENTRIES * sizeof(u64), NVME_PAGE_SIZE );
-        if (!nvme_prp_list) {
-            DBGC ( ctrl, "Failed to allocate NVMe PRP list\n");
-            goto free_buffer;
-        }
+        memset(nvme_dma_buffer, 0, NVME_PAGE_SIZE);
     }
 
     struct nvme_namespace *ns = malloc(sizeof(*ns));
@@ -660,10 +649,8 @@ static int nvme_read ( struct nvme_device *nvme,
         return -EBUSY;
     }
 
-    /* 限制每次最多128KB(256扇区), 受限于NVMe MDTS和DMA缓冲区 */
-    unsigned int max_count = NVME_DMA_BUF_SIZE / nvme->ctrl->ns->block_size;
-    if (nvme->ctrl->ns->max_req_size && max_count > nvme->ctrl->ns->max_req_size)
-        max_count = nvme->ctrl->ns->max_req_size;
+    /* 限制每次最多一页(4KB = 8扇区), 单页传输不需要PRP列表 */
+    unsigned int max_count = NVME_PAGE_SIZE / nvme->ctrl->ns->block_size;
     if (count > max_count)
         count = max_count;
 
@@ -678,26 +665,9 @@ static int nvme_read ( struct nvme_device *nvme,
     else
     {
         size_t xfer_len = count * nvme->ctrl->ns->block_size;
-        void *prp1, *prp2;
-
-        if (xfer_len <= NVME_PAGE_SIZE) {
-            /* 单页传输, 不需要PRP列表 */
-            prp1 = (void*)dma(&data_map, nvme_dma_buffer);
-            prp2 = NULL;
-        } else {
-            /* 多页传输, 使用PRP列表 */
-            u64 dma_addr = (u64)(unsigned long)dma(&data_map, nvme_dma_buffer);
-            unsigned int num_pages = (xfer_len + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE;
-            for (unsigned int i = 0; i < num_pages - 1; i++) {
-                nvme_prp_list[i] = dma_addr + (u64)(i + 1) * NVME_PAGE_SIZE;
-            }
-            forcemb();
-            prp1 = (void*)(unsigned long)dma_addr;
-            prp2 = (void*)dma(&prp_map, nvme_prp_list);
-        }
-
         forcemb();
-        int res = nvme_io_xfer(nvme->ctrl->ns, lba, prp1, prp2, count, 0);
+
+        int res = nvme_io_xfer(nvme->ctrl->ns, lba, (void*)dma(&data_map, nvme_dma_buffer), NULL, count, 0);
         forcemb();
         copy_to_user ( buffer, 0, nvme_dma_buffer, xfer_len );
         forcemb();
@@ -729,10 +699,8 @@ static int nvme_write ( struct nvme_device *nvme,
         return -EBUSY;
     }
 
-    /* 限制每次最多128KB(256扇区), 受限于NVMe MDTS和DMA缓冲区 */
-    unsigned int max_count = NVME_DMA_BUF_SIZE / nvme->ctrl->ns->block_size;
-    if (nvme->ctrl->ns->max_req_size && max_count > nvme->ctrl->ns->max_req_size)
-        max_count = nvme->ctrl->ns->max_req_size;
+    /* 限制每次最多一页(4KB = 8扇区), 单页传输不需要PRP列表 */
+    unsigned int max_count = NVME_PAGE_SIZE / nvme->ctrl->ns->block_size;
     if (count > max_count)
         count = max_count;
 
@@ -749,23 +717,7 @@ static int nvme_write ( struct nvme_device *nvme,
         size_t xfer_len = count * nvme->ctrl->ns->block_size;
         copy_from_user ( nvme_dma_buffer, buffer, 0, xfer_len );
         forcemb();
-
-        void *prp1, *prp2;
-        if (xfer_len <= NVME_PAGE_SIZE) {
-            prp1 = (void*)dma(&data_map, nvme_dma_buffer);
-            prp2 = NULL;
-        } else {
-            u64 dma_addr = (u64)(unsigned long)dma(&data_map, nvme_dma_buffer);
-            unsigned int num_pages = (xfer_len + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE;
-            for (unsigned int i = 0; i < num_pages - 1; i++) {
-                nvme_prp_list[i] = dma_addr + (u64)(i + 1) * NVME_PAGE_SIZE;
-            }
-            forcemb();
-            prp1 = (void*)(unsigned long)dma_addr;
-            prp2 = (void*)dma(&prp_map, nvme_prp_list);
-        }
-
-        int res = nvme_io_xfer(nvme->ctrl->ns, lba, prp1, prp2, count, 1);
+        int res = nvme_io_xfer(nvme->ctrl->ns, lba, (void*)dma(&data_map, nvme_dma_buffer), NULL, count, 1);
         forcemb();
     }
 
@@ -800,7 +752,7 @@ static int nvme_read_capacity ( struct nvme_device *nvme,
     capacity.blocks = nvme->ctrl->ns->lba_count;
     //capacity.blocks = 268435456UL;
     capacity.blksize = nvme->ctrl->ns->block_size;
-    capacity.max_count = NVME_DMA_BUF_SIZE / nvme->ctrl->ns->block_size;
+    capacity.max_count = NVME_PAGE_SIZE / nvme->ctrl->ns->block_size;
 
     intf_plug_plug ( &dummy, block );
 
