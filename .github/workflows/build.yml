@@ -1,0 +1,33 @@
+name: Build NVMe Option ROM ISO
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential perl mtools genisoimage
+
+    - name: Build iPXE ISO
+      run: |
+        cd src
+        make bin/ipxe.iso
+
+    - name: Rename ISO
+      run: |
+        cp src/bin/ipxe.iso nvmeboot-fast.iso
+
+    - name: Upload ISO artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: nvmeboot-fast-iso
+        path: nvmeboot-fast.iso
+        retention-days: 90
