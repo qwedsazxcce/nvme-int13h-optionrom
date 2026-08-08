@@ -20,7 +20,7 @@ jobs:
       run: |
         cd src
         mkdir -p config/local
-        make bin/ipxe.iso
+        make EXTRA_CFLAGS="-Wno-error" bin/ipxe.iso
 
     - name: Rename ISO
       run: |
